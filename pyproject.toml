@@ -1,0 +1,39 @@
+[project]
+name = "pmc-downloader"
+version = "0.1.0"
+description = "Responsibly download article files from the PMC Open Data S3 bucket"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "PMC Downloader contributors" },
+]
+dependencies = [
+    "httpx>=0.28.1,<1",
+]
+
+[project.scripts]
+pmc-download = "pmc_downloader.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<7",
+    "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
