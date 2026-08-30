@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pmc-download",
         description=(
             "Download article files for one or more PMC IDs from the public PMC Open Data bucket. "
-            "Every available article version is downloaded."
+            "Only the highest-numbered available article version is downloaded."
         ),
     )
     source = parser.add_mutually_exclusive_group(required=True)

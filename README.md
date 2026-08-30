@@ -70,18 +70,21 @@ already present. It exits with status `1` if any PMCID is absent from the data
 bucket, a requested type is unavailable, or a request fails. Other IDs continue
 to be processed after an individual failure.
 
-## Versions and output files
+## Version selection and output files
 
 PMC organizes files by article version. One PMCID may identify an author
-manuscript, a published version, or both. Because PMC states that a larger
-version number does not necessarily identify the preferred version, this tool
-downloads every available version and retains its suffix in flat output names:
+manuscript, a published version, or both. This tool treats the highest numeric
+version as the latest and downloads only that version. The version suffix is
+retained in the output filename:
 
 ```text
 articles/
-├── PMC11370360.1.pdf
 └── PMC11370360.2.pdf
 ```
+
+PMC notes that a higher version number reflects processing order and does not
+always identify the preferred form of an article. In particular, separate
+versions may represent an author manuscript and a final published article.
 
 Not every article visible on the PMC website is available for automated
 retrieval. The bucket contains versions in the PMC Article Datasets, including
@@ -125,4 +128,3 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pytest --cov=pmc_downloader
 ```
-
