@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -22,6 +23,7 @@ BUCKET = "pmc-oa-opendata"
 BUCKET_HOST = f"{BUCKET}.s3.amazonaws.com"
 BUCKET_URL = f"https://{BUCKET_HOST}"
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+LOGGER = logging.getLogger(__name__)
 
 
 class PmcDownloadError(RuntimeError):
@@ -147,6 +149,7 @@ class PmcClient:
         if destination.is_file() and expected_md5:
             actual_md5, size = _file_md5(destination)
             if actual_md5 == expected_md5:
+                LOGGER.info("Already present: %s (%d bytes)", destination, size)
                 return DownloadedObject(destination, downloaded=False, size=size)
 
         part_path = destination.with_name(f".{destination.name}.{os.getpid()}.part")
@@ -154,8 +157,16 @@ class PmcClient:
         for attempt in range(self._retries + 1):
             part_path.unlink(missing_ok=True)
             try:
+                LOGGER.info(
+                    "Downloading %s to %s (attempt %d of %d)",
+                    url,
+                    destination,
+                    attempt + 1,
+                    self._retries + 1,
+                )
                 size = self._download_once(url, part_path, expected_md5)
                 os.replace(part_path, destination)
+                LOGGER.info("Downloaded %s (%d bytes)", destination, size)
                 return DownloadedObject(destination, downloaded=True, size=size)
             except (httpx.TransportError, ChecksumMismatchError, _RetryableDownloadError) as exc:
                 last_error = exc
@@ -163,7 +174,9 @@ class PmcClient:
                 if attempt == self._retries:
                     break
                 retry_after = exc.retry_after if isinstance(exc, _RetryableDownloadError) else None
-                self._sleep(retry_after if retry_after is not None else 2**attempt)
+                wait = retry_after if retry_after is not None else 2**attempt
+                LOGGER.warning("Download attempt failed; retrying in %.2f seconds: %s", wait, exc)
+                self._sleep(wait)
             except Exception:
                 part_path.unlink(missing_ok=True)
                 raise
@@ -195,11 +208,15 @@ class PmcClient:
                 retry_after = _retry_after_seconds(response)
                 response.close()
                 if attempt < self._retries:
-                    self._sleep(retry_after if retry_after is not None else 2**attempt)
+                    wait = retry_after if retry_after is not None else 2**attempt
+                    LOGGER.warning("Request failed; retrying in %.2f seconds: %s", wait, last_error)
+                    self._sleep(wait)
                     continue
 
             if attempt < self._retries:
-                self._sleep(2**attempt)
+                wait = 2**attempt
+                LOGGER.warning("Request failed; retrying in %.2f seconds: %s", wait, last_error)
+                self._sleep(wait)
 
         raise PmcDownloadError(
             f"PMC request failed after {self._retries + 1} attempts: {url}: {last_error}"

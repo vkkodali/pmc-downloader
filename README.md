@@ -70,6 +70,13 @@ already present. It exits with status `1` if any PMCID is absent from the data
 bucket, a requested type is unavailable, or a request fails. Other IDs continue
 to be processed after an individual failure.
 
+While running, the command displays counters for the total number of unique PMC
+IDs, successful IDs, failed IDs, and IDs remaining. An ID succeeds only when all
+requested file types are downloaded or already present. The final screen output
+contains a summary and the path to a timestamped log file. Per-file results,
+saved paths, sizes, retries, and error details are written to that log in the
+output directory alongside the downloaded article files.
+
 ## Version selection and output files
 
 PMC organizes files by article version. One PMCID may identify an author

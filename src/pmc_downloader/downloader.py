@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from pmc_downloader.client import PmcClient, PmcDownloadError, s3_to_https
 
 SUPPORTED_FILE_TYPES = ("pdf", "xml", "txt", "json")
+LOGGER = logging.getLogger(__name__)
 METADATA_URL_FIELDS = {
     "pdf": "pdf_url",
     "xml": "xml_url",
@@ -34,75 +37,88 @@ def download_articles(
     pmcids: list[str],
     file_types: tuple[str, ...],
     output_dir: Path,
+    on_pmcid_complete: Callable[[str, list[DownloadResult]], None] | None = None,
 ) -> list[DownloadResult]:
     """Download requested file types for the highest-numbered version of each PMCID."""
     output_dir.mkdir(parents=True, exist_ok=True)
     results: list[DownloadResult] = []
 
     for pmcid in pmcids:
-        try:
-            versions = client.list_versions(pmcid)
-        except PmcDownloadError as exc:
-            results.append(DownloadResult(pmcid, None, None, "failed", detail=str(exc)))
-            continue
+        LOGGER.info("Processing %s", pmcid)
+        pmcid_results = _download_article(client, pmcid, file_types, output_dir)
+        results.extend(pmcid_results)
+        if on_pmcid_complete is not None:
+            on_pmcid_complete(pmcid, pmcid_results)
 
-        if not versions:
-            results.append(
-                DownloadResult(
-                    pmcid,
-                    None,
-                    None,
-                    "not-found",
-                    detail="no downloadable versions found in the PMC Open Data bucket",
-                )
+    return results
+
+
+def _download_article(
+    client: PmcClient,
+    pmcid: str,
+    file_types: tuple[str, ...],
+    output_dir: Path,
+) -> list[DownloadResult]:
+    try:
+        versions = client.list_versions(pmcid)
+    except PmcDownloadError as exc:
+        return [DownloadResult(pmcid, None, None, "failed", detail=str(exc))]
+
+    if not versions:
+        return [
+            DownloadResult(
+                pmcid,
+                None,
+                None,
+                "not-found",
+                detail="no downloadable versions found in the PMC Open Data bucket",
             )
+        ]
+
+    version = versions[-1]
+    try:
+        metadata, metadata_bytes = client.get_metadata(version)
+    except PmcDownloadError as exc:
+        return [DownloadResult(pmcid, version, None, "failed", detail=str(exc))]
+
+    results: list[DownloadResult] = []
+    for file_type in file_types:
+        if file_type == "json":
+            results.append(_save_metadata(pmcid, version, metadata, metadata_bytes, output_dir))
             continue
 
-        version = versions[-1]
-        try:
-            metadata, metadata_bytes = client.get_metadata(version)
-        except PmcDownloadError as exc:
-            results.append(DownloadResult(pmcid, version, None, "failed", detail=str(exc)))
-            continue
-
-        for file_type in file_types:
-            if file_type == "json":
-                results.append(_save_metadata(pmcid, version, metadata, metadata_bytes, output_dir))
-                continue
-
-            field = METADATA_URL_FIELDS[file_type]
-            source = metadata.get(field)
-            if not isinstance(source, str) or not source:
-                results.append(
-                    DownloadResult(
-                        pmcid,
-                        version,
-                        file_type,
-                        "unavailable",
-                        detail=f"metadata does not provide {field}",
-                    )
-                )
-                continue
-
-            try:
-                filename = Path(url_path(source)).name
-                downloaded = client.download(source, output_dir / filename)
-            except (OSError, PmcDownloadError) as exc:
-                results.append(DownloadResult(pmcid, version, file_type, "failed", detail=str(exc)))
-                continue
-
-            status = "downloaded" if downloaded.downloaded else "skipped"
+        field = METADATA_URL_FIELDS[file_type]
+        source = metadata.get(field)
+        if not isinstance(source, str) or not source:
             results.append(
                 DownloadResult(
                     pmcid,
                     version,
                     file_type,
-                    status,
-                    path=downloaded.path,
-                    detail=f"{downloaded.size} bytes",
+                    "unavailable",
+                    detail=f"metadata does not provide {field}",
                 )
             )
+            continue
 
+        try:
+            filename = Path(url_path(source)).name
+            downloaded = client.download(source, output_dir / filename)
+        except (OSError, PmcDownloadError) as exc:
+            results.append(DownloadResult(pmcid, version, file_type, "failed", detail=str(exc)))
+            continue
+
+        status = "downloaded" if downloaded.downloaded else "skipped"
+        results.append(
+            DownloadResult(
+                pmcid,
+                version,
+                file_type,
+                status,
+                path=downloaded.path,
+                detail=f"{downloaded.size} bytes",
+            )
+        )
     return results
 
 

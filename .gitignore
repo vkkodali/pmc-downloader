@@ -16,4 +16,8 @@ dist/
 
 # Downloaded article files
 downloads/
+bos_taurus_gene_pdfs/
 
+# Local input lists and run logs
+pmcids.txt
+pmc-download-*.log

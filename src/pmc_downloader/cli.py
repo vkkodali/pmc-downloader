@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 from pmc_downloader import __version__
 from pmc_downloader.client import PmcClient
@@ -15,6 +18,48 @@ from pmc_downloader.downloader import SUPPORTED_FILE_TYPES, DownloadResult, down
 
 DEFAULT_DELAY_SECONDS = 0.34
 PMCID_PATTERN = re.compile(r"(?:PMC)?([0-9]+)", re.IGNORECASE)
+SUCCESS_STATUSES = frozenset({"downloaded", "skipped"})
+LOGGER = logging.getLogger("pmc_downloader")
+
+
+class ProgressDisplay:
+    """Display PMCID-level progress without mixing in per-file details."""
+
+    def __init__(self, total: int, stream: TextIO) -> None:
+        self.total = total
+        self.stream = stream
+        self.succeeded = 0
+        self.failed = 0
+        self._interactive = stream.isatty()
+        self._started = False
+
+    def start(self) -> None:
+        self._write()
+
+    def complete(self, succeeded: bool) -> None:
+        if succeeded:
+            self.succeeded += 1
+        else:
+            self.failed += 1
+        self._write()
+
+    def close(self) -> None:
+        if self._interactive and self._started:
+            self.stream.write("\n")
+            self.stream.flush()
+
+    def _write(self) -> None:
+        remaining = self.total - self.succeeded - self.failed
+        line = (
+            f"Total: {self.total} | Succeeded: {self.succeeded} | "
+            f"Failed: {self.failed} | Remaining: {remaining}"
+        )
+        if self._interactive:
+            self.stream.write(f"\r{line}")
+        else:
+            self.stream.write(f"{line}\n")
+        self.stream.flush()
+        self._started = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -131,20 +176,83 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
-    with PmcClient(delay=DEFAULT_DELAY_SECONDS, email=args.email) as client:
-        results = download_articles(client, pmcids, file_types, args.output_dir)
+    try:
+        log_path, log_handler = _create_log_handler(args.output_dir)
+    except OSError as exc:
+        parser.error(f"could not create run log in {args.output_dir}: {exc}")
 
-    for result in results:
-        print(_format_result(result))
+    previous_level = LOGGER.level
+    previous_propagate = LOGGER.propagate
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    LOGGER.addHandler(log_handler)
+    progress = ProgressDisplay(len(pmcids), sys.stderr)
 
-    downloaded = sum(result.status == "downloaded" for result in results)
-    skipped = sum(result.status == "skipped" for result in results)
-    errors = sum(result.status in {"failed", "not-found", "unavailable"} for result in results)
-    print(
-        f"Summary: {downloaded} downloaded, {skipped} already present, {errors} unavailable/failed",
-        file=sys.stderr if errors else sys.stdout,
-    )
-    return 1 if errors else 0
+    try:
+        LOGGER.info("Starting PMC download run")
+        LOGGER.info("Output directory: %s", args.output_dir.resolve())
+        LOGGER.info("PMC IDs (%d): %s", len(pmcids), ", ".join(pmcids))
+        LOGGER.info("Requested file types: %s", ", ".join(file_types))
+        progress.start()
+
+        def pmcid_complete(_pmcid: str, pmcid_results: list[DownloadResult]) -> None:
+            for result in pmcid_results:
+                LOGGER.info("%s", _format_result(result))
+            progress.complete(_pmcid_succeeded(pmcid_results))
+
+        with PmcClient(delay=DEFAULT_DELAY_SECONDS, email=args.email) as client:
+            download_articles(
+                client,
+                pmcids,
+                file_types,
+                args.output_dir,
+                on_pmcid_complete=pmcid_complete,
+            )
+
+        succeeded = progress.succeeded
+        failed = progress.failed
+        LOGGER.info(
+            "Run complete: %d total PMC IDs, %d succeeded, %d failed",
+            len(pmcids),
+            succeeded,
+            failed,
+        )
+    except Exception:
+        LOGGER.exception("PMC download run aborted")
+        raise
+    finally:
+        progress.close()
+        LOGGER.removeHandler(log_handler)
+        log_handler.close()
+        LOGGER.setLevel(previous_level)
+        LOGGER.propagate = previous_propagate
+
+    summary_stream = sys.stderr if failed else sys.stdout
+    print("Summary:", file=summary_stream)
+    print(f"  Total PMC IDs: {len(pmcids)}", file=summary_stream)
+    print(f"  Succeeded: {succeeded}", file=summary_stream)
+    print(f"  Failed: {failed}", file=summary_stream)
+    print("  Remaining: 0", file=summary_stream)
+    print(f"  Log: {log_path}", file=summary_stream)
+    return 1 if failed else 0
+
+
+def _create_log_handler(output_dir: Path) -> tuple[Path, logging.FileHandler]:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    for number in range(1, 10_000):
+        suffix = "" if number == 1 else f"-{number}"
+        path = output_dir / f"pmc-download-{timestamp}{suffix}.log"
+        try:
+            handler = logging.FileHandler(path, mode="x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        return path, handler
+    raise OSError("could not choose a unique log filename")
+
+
+def _pmcid_succeeded(results: list[DownloadResult]) -> bool:
+    return bool(results) and all(result.status in SUCCESS_STATUSES for result in results)
 
 
 def _format_result(result: DownloadResult) -> str:

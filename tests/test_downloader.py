@@ -68,3 +68,36 @@ def test_download_articles_reports_unknown_pmcid(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].status == "not-found"
     assert results[0].pmcid == "PMC999"
+
+
+def test_download_articles_reports_progress_after_each_pmcid(tmp_path: Path) -> None:
+    listing = b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <CommonPrefixes><Prefix>PMC123.1/</Prefix></CommonPrefixes>
+    </ListBucketResult>"""
+    metadata = {"pdf_url": None}
+    completed: list[tuple[str, list[str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("prefix") == "PMC123.":
+            return httpx.Response(200, content=listing)
+        if request.url.params.get("prefix") == "PMC999.":
+            return httpx.Response(200, content=b"<ListBucketResult />")
+        if request.url.path == "/metadata/PMC123.1.json":
+            return httpx.Response(200, json=metadata)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with PmcClient(delay=0, transport=httpx.MockTransport(handler)) as client:
+        download_articles(
+            client,
+            ["PMC123", "PMC999"],
+            ("pdf",),
+            tmp_path,
+            on_pmcid_complete=lambda pmcid, results: completed.append(
+                (pmcid, [result.status for result in results])
+            ),
+        )
+
+    assert completed == [
+        ("PMC123", ["unavailable"]),
+        ("PMC999", ["not-found"]),
+    ]
