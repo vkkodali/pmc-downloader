@@ -26,23 +26,33 @@ pmc-download --help
 
 ## Usage
 
-Pass PMC IDs as one comma-delimited argument. The `PMC` prefix is optional and
-case-insensitive:
+Pass identifiers as one comma-delimited argument. Both PMCIDs and PubMed IDs
+are accepted:
 
 ```console
-uv run pmc-download PMC10009416,PMC12855588
+uv run pmc-download PMC10009416,PMC12855588,36969844
 ```
 
-Or read one PMC ID per line from a UTF-8 text file:
+Or read one identifier per line from a UTF-8 text file:
 
 ```text
 PMC10009416
 PMC12855588
+36969844
 ```
 
 ```console
-uv run pmc-download --input-file pmcids.txt
+uv run pmc-download --input-file identifiers.txt
 ```
+
+An identifier carrying the `PMC` prefix is a PMC accession ID; the prefix is
+case-insensitive. Anything else is treated as a PMID, with or without a `PMID`
+prefix:
+
+| Identifier | Read as |
+| --- | --- |
+| `PMC10034327`, `pmc10034327` | PMCID |
+| `36969844`, `PMID:36969844`, `pmid 36969844` | PMID |
 
 PDF is the default file type. Use `--types` (or `--file-types`) to request one
 or more of the core article objects:
@@ -66,16 +76,47 @@ Set `--email researcher@example.org` or the `NCBI_EMAIL` environment variable
 to include a contact address in the HTTP `User-Agent`.
 
 The command exits with status `0` when every requested object is downloaded or
-already present. It exits with status `1` if any PMCID is absent from the data
-bucket, a requested type is unavailable, or a request fails. Other IDs continue
-to be processed after an individual failure.
+already present. It exits with status `1` if a PMID has no PMCID, a PMCID is
+absent from the data bucket, a requested type is unavailable, or a request
+fails. Other IDs continue to be processed after an individual failure.
 
 While running, the command displays counters for the total number of unique PMC
-IDs, successful IDs, failed IDs, and IDs remaining. An ID succeeds only when all
-requested file types are downloaded or already present. The final screen output
+IDs to download, successful IDs, failed IDs, and IDs remaining. An ID succeeds
+only when all requested file types are downloaded or already present. The final screen output
 contains a summary and the path to a timestamped log file. Per-file results,
 saved paths, sizes, retries, and error details are written to that log in the
 output directory alongside the downloaded article files.
+
+## PMID conversion
+
+PMC stores articles by PMCID, so a PMID has to be converted before anything can
+be downloaded. The command does that in one step before the downloads start,
+with the [NCBI Entrez Utilities](https://www.ncbi.nlm.nih.gov/books/NBK25497/)
+`elink.fcgi` endpoint (`dbfrom=pubmed`, `db=pmc`, `linkname=pubmed_pmc`), in
+batches of up to 200 PMIDs per request.
+
+Not every PubMed record has a copy in PMC. A PMID that PubMed does not link to a
+PMC record is reported and skipped automatically; the rest of the run continues:
+
+```console
+$ uv run pmc-download PMC10009416,36969844,PMID:1 --types json
+Summary:
+  Input identifiers: 3
+  PMIDs converted to PMCIDs: 1
+  PMIDs without a PMCID (skipped): 1
+    PMID:1
+  Total PMC IDs: 2
+  Succeeded: 2
+  Failed: 0
+  Remaining: 0
+```
+
+Every conversion, including each skipped PMID, is written to the run log. The
+summary lists at most 20 skipped PMIDs; the log always holds the full set. A
+PMID that resolves to a PMCID already named in the input is downloaded once.
+
+Setting `--email` (or `NCBI_EMAIL`) also identifies the run to the Entrez
+Utilities through their `tool` and `email` parameters, as NCBI requests.
 
 ## Version selection and output files
 
@@ -102,7 +143,8 @@ have a PDF.
 
 The downloader deliberately favors safe, predictable access:
 
-- It makes requests sequentially, never concurrently.
+- It makes requests sequentially, never concurrently, including the Entrez
+  Utilities lookups.
 - It waits at least 0.34 seconds between request starts (fewer than three per
   second), following the conservative unauthenticated rate in the
   [NCBI E-utilities usage guidelines](https://www.ncbi.nlm.nih.gov/books/NBK25497/#chapter2.Frequency_Timing_and_Registration_o).

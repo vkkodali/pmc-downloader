@@ -10,29 +10,9 @@ from pmc_downloader.client import (
     BUCKET_URL,
     PmcClient,
     PmcDownloadError,
-    RateLimiter,
     md5_from_url,
     s3_to_https,
 )
-
-
-def test_rate_limiter_waits_for_remaining_interval() -> None:
-    current = [10.0]
-    waits: list[float] = []
-
-    def clock() -> float:
-        return current[0]
-
-    def sleep(seconds: float) -> None:
-        waits.append(seconds)
-        current[0] += seconds
-
-    limiter = RateLimiter(0.5, clock=clock, sleep=sleep)
-    limiter.wait()
-    current[0] += 0.2
-    limiter.wait()
-
-    assert waits == pytest.approx([0.3])
 
 
 def test_list_versions_uses_exact_prefix_and_numeric_sorting() -> None:

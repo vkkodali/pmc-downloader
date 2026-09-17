@@ -5,11 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
@@ -17,16 +13,20 @@ from xml.etree import ElementTree
 
 import httpx
 
-from pmc_downloader import __version__
+from pmc_downloader.http import (
+    RETRYABLE_STATUS_CODES,
+    HttpSession,
+    NcbiRequestError,
+    retry_after_seconds,
+)
 
 BUCKET = "pmc-oa-opendata"
 BUCKET_HOST = f"{BUCKET}.s3.amazonaws.com"
 BUCKET_URL = f"https://{BUCKET_HOST}"
-RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 LOGGER = logging.getLogger(__name__)
 
 
-class PmcDownloadError(RuntimeError):
+class PmcDownloadError(NcbiRequestError):
     """Base error raised for PMC lookup and download failures."""
 
 
@@ -49,67 +49,11 @@ class DownloadedObject:
     size: int
 
 
-class RateLimiter:
-    """Enforce a minimum interval between the start of HTTP requests."""
-
-    def __init__(
-        self,
-        interval: float,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self.interval = interval
-        self._clock = clock
-        self._sleep = sleep
-        self._last_request: float | None = None
-
-    def wait(self) -> None:
-        """Wait until another request can be started."""
-        now = self._clock()
-        if self._last_request is not None:
-            remaining = self.interval - (now - self._last_request)
-            if remaining > 0:
-                self._sleep(remaining)
-                now = self._clock()
-        self._last_request = now
-
-
-class PmcClient:
+class PmcClient(HttpSession):
     """Retrieve article metadata and objects without AWS credentials."""
 
-    def __init__(
-        self,
-        *,
-        delay: float = 0.34,
-        retries: int = 3,
-        email: str | None = None,
-        transport: httpx.BaseTransport | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        user_agent = f"pmc-downloader/{__version__}"
-        if email:
-            user_agent = f"{user_agent} (mailto:{email})"
-
-        self._sleep = sleep
-        self._limiter = RateLimiter(delay, sleep=sleep)
-        self._retries = retries
-        self._http = httpx.Client(
-            follow_redirects=True,
-            headers={"User-Agent": user_agent},
-            timeout=httpx.Timeout(60.0, connect=10.0),
-            transport=transport,
-        )
-
-    def __enter__(self) -> PmcClient:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
-
-    def close(self) -> None:
-        """Close the underlying connection pool."""
-        self._http.close()
+    service = "PMC"
+    error = PmcDownloadError
 
     def list_versions(self, pmcid: str) -> list[str]:
         """Return all S3 version prefixes belonging to a PMCID."""
@@ -185,43 +129,6 @@ class PmcClient:
             f"failed to download {url} after {self._retries + 1} attempts: {last_error}"
         ) from last_error
 
-    def _get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
-        last_error: Exception | None = None
-        for attempt in range(self._retries + 1):
-            self._limiter.wait()
-            try:
-                response = self._http.get(url, params=params)
-            except httpx.TransportError as exc:
-                last_error = exc
-            else:
-                if response.status_code not in RETRYABLE_STATUS_CODES:
-                    try:
-                        response.raise_for_status()
-                    except httpx.HTTPStatusError as exc:
-                        raise PmcDownloadError(
-                            f"PMC request failed with HTTP {response.status_code}: {response.url}"
-                        ) from exc
-                    return response
-                last_error = PmcDownloadError(
-                    f"PMC request failed with HTTP {response.status_code}: {response.url}"
-                )
-                retry_after = _retry_after_seconds(response)
-                response.close()
-                if attempt < self._retries:
-                    wait = retry_after if retry_after is not None else 2**attempt
-                    LOGGER.warning("Request failed; retrying in %.2f seconds: %s", wait, last_error)
-                    self._sleep(wait)
-                    continue
-
-            if attempt < self._retries:
-                wait = 2**attempt
-                LOGGER.warning("Request failed; retrying in %.2f seconds: %s", wait, last_error)
-                self._sleep(wait)
-
-        raise PmcDownloadError(
-            f"PMC request failed after {self._retries + 1} attempts: {url}: {last_error}"
-        ) from last_error
-
     def _download_once(self, url: str, part_path: Path, expected_md5: str | None) -> int:
         self._limiter.wait()
         digest = hashlib.md5(usedforsecurity=False)
@@ -230,7 +137,7 @@ class PmcClient:
             if response.status_code in RETRYABLE_STATUS_CODES:
                 raise _RetryableDownloadError(
                     f"PMC request failed with HTTP {response.status_code}: {response.url}",
-                    retry_after=_retry_after_seconds(response),
+                    retry_after=retry_after_seconds(response),
                 )
             try:
                 response.raise_for_status()
@@ -295,19 +202,3 @@ def _copy_response(response: httpx.Response, output: BinaryIO, digest: object) -
         digest.update(chunk)  # type: ignore[attr-defined]
         size += len(chunk)
     return size
-
-
-def _retry_after_seconds(response: httpx.Response) -> float | None:
-    value = response.headers.get("Retry-After")
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        try:
-            retry_at = parsedate_to_datetime(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=UTC)
-        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())

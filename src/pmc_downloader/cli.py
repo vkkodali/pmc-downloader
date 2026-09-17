@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
@@ -15,10 +15,17 @@ from typing import TextIO
 from pmc_downloader import __version__
 from pmc_downloader.client import PmcClient
 from pmc_downloader.downloader import SUPPORTED_FILE_TYPES, DownloadResult, download_articles
+from pmc_downloader.entrez import EntrezClient
+from pmc_downloader.identifiers import (
+    PMCID,
+    Identifier,
+    parse_identifiers,
+    read_identifiers,
+)
 
 DEFAULT_DELAY_SECONDS = 0.34
-PMCID_PATTERN = re.compile(r"(?:PMC)?([0-9]+)", re.IGNORECASE)
 SUCCESS_STATUSES = frozenset({"downloaded", "skipped"})
+MAX_REPORTED_SKIPS = 20
 LOGGER = logging.getLogger("pmc_downloader")
 
 
@@ -67,21 +74,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pmc-download",
         description=(
-            "Download article files for one or more PMC IDs from the public PMC Open Data bucket. "
-            "Only the highest-numbered available article version is downloaded."
+            "Download article files for one or more PMCIDs or PMIDs from the public PMC Open "
+            "Data bucket. PMIDs are converted to PMCIDs with the NCBI Entrez Utilities, and "
+            "PMIDs without a PMC copy are reported and skipped. Only the highest-numbered "
+            "available article version is downloaded."
         ),
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
-        "pmcids",
+        "identifiers",
         nargs="?",
-        help="comma-delimited PMC IDs, such as PMC10009416,PMC12855588",
+        help=(
+            "comma-delimited PMCIDs or PMIDs, such as PMC10034327,36969844; an identifier "
+            "without the PMC prefix is treated as a PMID"
+        ),
     )
     source.add_argument(
         "-i",
         "--input-file",
         type=Path,
-        help="path to a text file containing one PMC ID per line",
+        help="path to a text file containing one PMCID or PMID per line",
     )
     parser.add_argument(
         "-t",
@@ -101,7 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--email",
         default=os.environ.get("NCBI_EMAIL"),
-        help="contact email to include in the HTTP User-Agent (or set NCBI_EMAIL)",
+        help=(
+            "contact email to include in the HTTP User-Agent and in Entrez Utilities "
+            "requests (or set NCBI_EMAIL)"
+        ),
     )
     parser.add_argument(
         "--version",
@@ -109,43 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     return parser
-
-
-def normalize_pmcid(value: str) -> str:
-    """Validate and normalize one PMC accession ID."""
-    candidate = value.strip()
-    match = PMCID_PATTERN.fullmatch(candidate)
-    if not match or int(match.group(1)) == 0:
-        raise ValueError(f"invalid PMC ID: {value!r}")
-    return f"PMC{int(match.group(1))}"
-
-
-def parse_pmcids(value: str) -> list[str]:
-    """Parse a comma-delimited list of PMC IDs, retaining input order."""
-    parts = value.split(",")
-    if any(not part.strip() for part in parts):
-        raise ValueError("PMC ID list contains an empty value")
-    return _deduplicate(normalize_pmcid(part) for part in parts)
-
-
-def read_pmcids(path: Path) -> list[str]:
-    """Read one PMC ID per non-empty line from a UTF-8 text file."""
-    try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except OSError as exc:
-        raise ValueError(f"could not read input file {path}: {exc}") from exc
-
-    pmcids: list[str] = []
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            pmcids.append(normalize_pmcid(line))
-        except ValueError as exc:
-            raise ValueError(f"{path}:{line_number}: {exc}") from exc
-    if not pmcids:
-        raise ValueError(f"input file contains no PMC IDs: {path}")
-    return _deduplicate(pmcids)
 
 
 def parse_file_types(value: str) -> tuple[str, ...]:
@@ -168,7 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        pmcids = read_pmcids(args.input_file) if args.input_file else parse_pmcids(args.pmcids)
+        identifiers = (
+            read_identifiers(args.input_file)
+            if args.input_file
+            else parse_identifiers(args.identifiers)
+        )
         file_types = parse_file_types(args.types)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         if not args.output_dir.is_dir():
@@ -186,13 +168,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
     LOGGER.addHandler(log_handler)
-    progress = ProgressDisplay(len(pmcids), sys.stderr)
+    progress: ProgressDisplay | None = None
 
     try:
         LOGGER.info("Starting PMC download run")
         LOGGER.info("Output directory: %s", args.output_dir.resolve())
-        LOGGER.info("PMC IDs (%d): %s", len(pmcids), ", ".join(pmcids))
+        LOGGER.info(
+            "Identifiers (%d): %s",
+            len(identifiers),
+            ", ".join(identifier.label for identifier in identifiers),
+        )
         LOGGER.info("Requested file types: %s", ", ".join(file_types))
+
+        resolution = resolve_identifiers(identifiers, args.email)
+        pmcids = resolution.pmcids
+        LOGGER.info("PMC IDs (%d): %s", len(pmcids), ", ".join(pmcids))
+        progress = ProgressDisplay(len(pmcids), sys.stderr)
         progress.start()
 
         def pmcid_complete(_pmcid: str, pmcid_results: list[DownloadResult]) -> None:
@@ -221,20 +212,75 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.exception("PMC download run aborted")
         raise
     finally:
-        progress.close()
+        if progress is not None:
+            progress.close()
         LOGGER.removeHandler(log_handler)
         log_handler.close()
         LOGGER.setLevel(previous_level)
         LOGGER.propagate = previous_propagate
 
-    summary_stream = sys.stderr if failed else sys.stdout
+    skipped = len(resolution.unresolved)
+    summary_stream = sys.stderr if failed or skipped else sys.stdout
     print("Summary:", file=summary_stream)
+    if resolution.converted or skipped:
+        print(f"  Input identifiers: {len(identifiers)}", file=summary_stream)
+        print(f"  PMIDs converted to PMCIDs: {len(resolution.converted)}", file=summary_stream)
+        print(f"  PMIDs without a PMCID (skipped): {skipped}", file=summary_stream)
+        if skipped:
+            print(f"    {_skipped_pmids(resolution.unresolved)}", file=summary_stream)
     print(f"  Total PMC IDs: {len(pmcids)}", file=summary_stream)
     print(f"  Succeeded: {succeeded}", file=summary_stream)
     print(f"  Failed: {failed}", file=summary_stream)
     print("  Remaining: 0", file=summary_stream)
     print(f"  Log: {log_path}", file=summary_stream)
-    return 1 if failed else 0
+    return 1 if failed or skipped else 0
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """PMCIDs to download, and the PMIDs that could not be converted to one."""
+
+    pmcids: list[str]
+    converted: list[tuple[str, str]]
+    unresolved: list[str]
+
+
+def resolve_identifiers(identifiers: Sequence[Identifier], email: str | None) -> Resolution:
+    """Convert every requested PMID to a PMCID, skipping those PMC does not hold."""
+    pmids = [identifier.value for identifier in identifiers if identifier.kind != PMCID]
+    converted: dict[str, str | None] = {}
+    if pmids:
+        LOGGER.info("Converting %d PMID(s) to PMCIDs with the NCBI Entrez Utilities", len(pmids))
+        with EntrezClient(delay=DEFAULT_DELAY_SECONDS, email=email) as client:
+            converted = client.pmids_to_pmcids(pmids)
+
+    pmcids: list[str] = []
+    resolved: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    for identifier in identifiers:
+        if identifier.kind == PMCID:
+            pmcids.append(identifier.value)
+            continue
+        pmcid = converted.get(identifier.value)
+        if pmcid is None:
+            LOGGER.warning(
+                "[NO-PMCID] %s: skipped; PubMed reports no PMC copy of this record",
+                identifier.label,
+            )
+            unresolved.append(identifier.value)
+            continue
+        LOGGER.info("Converted %s to %s", identifier.label, pmcid)
+        resolved.append((identifier.value, pmcid))
+        pmcids.append(pmcid)
+
+    return Resolution(_deduplicate(pmcids), resolved, unresolved)
+
+
+def _skipped_pmids(unresolved: Sequence[str]) -> str:
+    shown = [f"PMID:{pmid}" for pmid in unresolved[:MAX_REPORTED_SKIPS]]
+    if len(unresolved) > MAX_REPORTED_SKIPS:
+        shown.append(f"and {len(unresolved) - MAX_REPORTED_SKIPS} more (see log)")
+    return ", ".join(shown)
 
 
 def _create_log_handler(output_dir: Path) -> tuple[Path, logging.FileHandler]:
